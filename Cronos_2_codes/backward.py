@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # -------------------- ARGUMENT PARSING --------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Chronos SMD Anomaly Detection (VUS metrics)")
+    parser = argparse.ArgumentParser(description="Chronos SMD Backward Anomaly Detection (VUS metrics)")
     parser.add_argument(
         "--split_ratio",
         type=float,
@@ -36,7 +36,7 @@ def parse_args():
         "--context_length",
         type=int,
         default=512,
-        help="Number of past timestamps to use as context for predictions"
+        help="Number of future timestamps to use as (reversed) context for predictions"
     )
     parser.add_argument(
         "--gpu",
@@ -73,7 +73,7 @@ def parse_args():
     parser.add_argument(
         "--smooth_window",
         type=int,
-        default=5,
+        default=10,
         help="Uniform smoothing window for final anomaly score (1 = no smoothing)"
     )
     parser.add_argument(
@@ -134,55 +134,132 @@ def split_dataset(df, split_ratio):
     return df_train, df_test
 
 
+# -------------------- BACKWARD HELPERS --------------------
+def reverse_context(df, feature_list):
+    # Reverse feature values row-wise while keeping timestamps forward-increasing
+    # so Chronos (forward-only) accepts the series. Row 0 of the result holds
+    # the feature values that were originally at the LAST row of `df`.
+    df = df.reset_index(drop=True)
+    rev = df[feature_list].iloc[::-1].reset_index(drop=True)
+    rev["timestamp"] = df["timestamp"].values
+    rev["id"] = df["id"].iloc[0]
+    return rev
+
+
+def flip_predictions(pred_df):
+    # Predictions for a reversed context come out in reverse real-time order.
+    # Flip quantile values per feature so row i aligns with target_start + i.
+    q_cols = ["0.1", "0.5", "0.9"]
+    parts = []
+    for _, grp in pred_df.groupby("target_name", sort=False):
+        grp = grp.reset_index(drop=True)
+        flipped = grp.copy()
+        flipped[q_cols] = grp[q_cols].iloc[::-1].reset_index(drop=True).values
+        parts.append(flipped)
+    return pd.concat(parts, ignore_index=True)
+
+
 # -------------------- PREDICTION --------------------
-def generate_prediction(df_train, df_test, feature_list, prediction_length, context_length):
+def generate_backward_prediction(df_train, df_test, feature_list, prediction_length, context_length):
+    """
+    For each test window [s, s+W):
+      - Take up to `context_length` rows AFTER the window as context and reverse them.
+      - Ask Chronos to predict W steps forward in fake-time. These correspond, in real
+        time, to the target window read right-to-left.
+      - Flip the quantile predictions back to forward order.
+      - If no future is available (final window), fall back to a forward forecast from
+        past context so every row of df_test is still scored.
+    """
     window_length    = prediction_length
     all_predictions  = []
     id_column        = "id"
     timestamp_column = "timestamp"
-    num_windows      = len(df_test) // window_length
-    remainder        = len(df_test) % window_length
+
+    full_df   = pd.concat([df_train, df_test], axis=0, ignore_index=True)
+    train_len = len(df_train)
+    test_len  = len(df_test)
+
+    num_windows = test_len // window_length
+    remainder   = test_len %  window_length
 
     for i in range(num_windows):
-        start = i * window_length
+        start        = i * window_length
+        window_start = train_len + start
+        window_end   = window_start + window_length
 
-        if i == 0:
-            df_train_window = df_train.copy()
+        fut_start = window_end
+        fut_end   = min(fut_start + context_length, len(full_df))
+
+        if fut_end > fut_start:
+            ctx = full_df.iloc[fut_start:fut_end]
+            ctx = reverse_context(ctx, feature_list)
+
+            pred_df = pipeline.predict_df(
+                ctx,
+                future_df=None,
+                prediction_length=window_length,
+                quantile_levels=[0.1, 0.5, 0.9],
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                target=feature_list,
+                context_length=context_length,
+                validate_inputs=False
+            )
+            pred_df = flip_predictions(pred_df)
         else:
-            df_past_test    = df_test.iloc[:start].copy()
-            df_train_window = pd.concat([df_train, df_past_test], ignore_index=True)
-
-        pred_df = pipeline.predict_df(
-            df_train_window,
-            future_df=None,
-            prediction_length=window_length,
-            quantile_levels=[0.1, 0.5, 0.9],
-            id_column=id_column,
-            timestamp_column=timestamp_column,
-            target=feature_list,
-            context_length=context_length,
-            validate_inputs=False
-        )
+            past = full_df.iloc[:window_start].iloc[-context_length:]
+            pred_df = pipeline.predict_df(
+                past,
+                future_df=None,
+                prediction_length=window_length,
+                quantile_levels=[0.1, 0.5, 0.9],
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                target=feature_list,
+                context_length=context_length,
+                validate_inputs=False
+            )
 
         pred_df["window_id"] = i
         all_predictions.append(pred_df)
 
     if remainder > 0:
-        start           = num_windows * window_length
-        df_past_test    = df_test.iloc[:start].copy()
-        df_train_window = pd.concat([df_train, df_past_test], ignore_index=True)
+        start        = num_windows * window_length
+        window_start = train_len + start
+        window_end   = window_start + remainder
 
-        pred_df = pipeline.predict_df(
-            df_train_window,
-            future_df=None,
-            prediction_length=remainder,
-            quantile_levels=[0.1, 0.5, 0.9],
-            id_column=id_column,
-            timestamp_column=timestamp_column,
-            target=feature_list,
-            context_length=context_length,
-            validate_inputs=False
-        )
+        fut_start = window_end
+        fut_end   = min(fut_start + context_length, len(full_df))
+
+        if fut_end > fut_start:
+            ctx = full_df.iloc[fut_start:fut_end]
+            ctx = reverse_context(ctx, feature_list)
+
+            pred_df = pipeline.predict_df(
+                ctx,
+                future_df=None,
+                prediction_length=remainder,
+                quantile_levels=[0.1, 0.5, 0.9],
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                target=feature_list,
+                context_length=context_length,
+                validate_inputs=False
+            )
+            pred_df = flip_predictions(pred_df)
+        else:
+            past = full_df.iloc[:window_start].iloc[-context_length:]
+            pred_df = pipeline.predict_df(
+                past,
+                future_df=None,
+                prediction_length=remainder,
+                quantile_levels=[0.1, 0.5, 0.9],
+                id_column=id_column,
+                timestamp_column=timestamp_column,
+                target=feature_list,
+                context_length=context_length,
+                validate_inputs=False
+            )
 
         pred_df["window_id"] = num_windows
         all_predictions.append(pred_df)
@@ -270,7 +347,7 @@ for f in tqdm(file_list, desc="Processing SMD files", unit="file"):
     df_train["id"] = "SMD"
     df_test["id"]  = "SMD"
 
-    prediction_df = generate_prediction(
+    prediction_df = generate_backward_prediction(
         df_train, df_test, feature_list, prediction_length, context_length
     )
 
@@ -307,23 +384,43 @@ for f in tqdm(file_list, desc="Processing SMD files", unit="file"):
         version=args.vus_version,
         thre=args.vus_thre,
     )
-    
+
     vus_roc = evaluation_result["VUS-ROC"]
     vus_pr  = evaluation_result["VUS-PR"]
-    print(f"VUS-ROC: {vus_roc:.4f} | VUS-PR: {vus_pr:.4f}")
+    auroc   = evaluation_result["AUC-ROC"]
+    auprc   = evaluation_result["AUC-PR"]
+    print(f"AUROC: {auroc:.4f} | AUPRC: {auprc:.4f} | "
+          f"VUS-ROC: {vus_roc:.4f} | VUS-PR: {vus_pr:.4f}")
 
     dic_for_each_file["file_name"].append(file_name)
+    dic_for_each_file["AUROC"].append(auroc)
+    dic_for_each_file["AUPRC"].append(auprc)
     dic_for_each_file["VUS-ROC"].append(vus_roc)
     dic_for_each_file["VUS-PR"].append(vus_pr)
 
 
 # -------------------- SUMMARY --------------------
+auroc_list   = dic_for_each_file["AUROC"]
+auprc_list   = dic_for_each_file["AUPRC"]
 vus_roc_list = dic_for_each_file["VUS-ROC"]
 vus_pr_list  = dic_for_each_file["VUS-PR"]
 
+mean_auroc   = float(np.mean(auroc_list))   if auroc_list   else float("nan")
+mean_auprc   = float(np.mean(auprc_list))   if auprc_list   else float("nan")
 mean_vus_roc = float(np.mean(vus_roc_list)) if vus_roc_list else float("nan")
 mean_vus_pr  = float(np.mean(vus_pr_list))  if vus_pr_list  else float("nan")
 
 print("\nFinished processing all SMD files")
+print("\nPer-file results:")
+for name, ar, ap, vr, vp in zip(
+    dic_for_each_file["file_name"],
+    auroc_list, auprc_list, vus_roc_list, vus_pr_list,
+):
+    print(f"  {name}: AUROC={ar:.4f} | AUPRC={ap:.4f} | "
+          f"VUS-ROC={vr:.4f} | VUS-PR={vp:.4f}")
+
+print("\nMean metrics:")
+print(f"Mean AUROC  : {mean_auroc:.4f}")
+print(f"Mean AUPRC  : {mean_auprc:.4f}")
 print(f"Mean VUS-ROC: {mean_vus_roc:.4f}")
 print(f"Mean VUS-PR : {mean_vus_pr:.4f}")
