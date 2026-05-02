@@ -23,10 +23,21 @@ import pickle
 # Reduce CUDA memory fragmentation before importing torch
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+import numpy as np
 import torch
 from chronos import BaseChronosPipeline, Chronos2Pipeline
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log_path = os.path.join("./prepared_data/log", "fine_tune.log")
+os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_path),
+    ]
+)
 logger = logging.getLogger(__name__)
 
 
@@ -109,25 +120,40 @@ def main():
     # ------------------------------------------------------------------
     # Load prepared data
     # ------------------------------------------------------------------
-    train_path = os.path.join(args.data_dir, "train_inputs.pkl")
-    val_path = os.path.join(args.data_dir, "val_inputs.pkl")
+    train_path = os.path.join(args.data_dir, "train_pairs.pkl")
+    val_path = os.path.join(args.data_dir, "val_pairs.pkl")
 
     if not os.path.exists(train_path):
         raise FileNotFoundError(
             f"Training data not found at {train_path}. "
-            "Run prepare_data.py first."
+            "Run prepare_instrcution_data.py first."
         )
 
-    logger.info(f"Loading training data from {train_path}")
+    logger.info(f"Loading training pairs from {train_path}")
     with open(train_path, "rb") as f:
-        train_inputs = pickle.load(f)
-    logger.info(f"  {len(train_inputs)} training series loaded")
+        train_pairs = pickle.load(f)
+    logger.info(f"  {len(train_pairs)} training pairs loaded")
+
+    # Each pair {'context': {'target': (F, ctx)}, 'future': {'target': (F, pred)}}
+    # is concatenated into {'target': (F, ctx+pred)} so that Chronos2's internal
+    # sampler sees a series of exactly one window — preserving the pre-defined pairs.
+    def pairs_to_inputs(pairs):
+        return [
+            {"target": np.concatenate(
+                [p["context"]["target"], p["future"]["target"]], axis=1
+            )}
+            for p in pairs
+        ]
+
+    train_inputs = pairs_to_inputs(train_pairs)
+    logger.info(f"  Converted to {len(train_inputs)} fixed-window series for instruction tuning")
 
     val_inputs = None
     if not args.no_validation and os.path.exists(val_path):
-        logger.info(f"Loading validation data from {val_path}")
+        logger.info(f"Loading validation pairs from {val_path}")
         with open(val_path, "rb") as f:
-            val_inputs = pickle.load(f)
+            val_pairs = pickle.load(f)
+        val_inputs = pairs_to_inputs(val_pairs)
         logger.info(f"  {len(val_inputs)} validation series loaded")
 
     # ------------------------------------------------------------------
