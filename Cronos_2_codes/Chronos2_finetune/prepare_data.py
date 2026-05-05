@@ -368,6 +368,62 @@ def create_type_c_pairs(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Model-Ready Input Conversion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pairs_to_model_inputs(
+    pairs: list[dict],
+    context_length: int,
+) -> list[dict]:
+    """
+    Convert instruction pairs into model-ready inputs for pipeline.fit().
+
+    Why NaN-padding is necessary
+    -----------------------------
+    Chronos2Dataset randomly picks a cut point (slice_idx) from the range
+    [min_past, series_length - prediction_length].  When pipeline.fit() is
+    called with min_past=context_length, that range collapses to a single
+    value — context_length — so the cut is always exactly at the intended
+    context/future boundary.
+
+    This only works if EVERY series is exactly context_length + prediction_length
+    long.  Type B pairs can have a shorter context (the anomaly may occur close
+    to the start of the normal zone), so we left-pad those with NaN.  The model
+    already masks NaN positions via context_mask, so the padding is invisible
+    to the loss computation.
+
+    Parameters
+    ----------
+    pairs          : list of dicts with 'context' and 'future' keys produced
+                     by build_pairs_for_series()
+    context_length : the fixed context length used during data preparation
+
+    Returns
+    -------
+    list of {'target': array(F, context_length + prediction_length)} dicts
+    ready to be passed directly to pipeline.fit(..., min_past=context_length)
+    """
+    model_inputs = []
+    for p in pairs:
+        ctx = p["context"]["target"]   # (F, ctx_len), may be < context_length for Type B
+        fut = p["future"]["target"]    # (F, prediction_length)
+
+        F, ctx_len = ctx.shape
+        if ctx_len < context_length:
+            # Left-pad with NaN; the model masks these positions automatically
+            padding = np.full((F, context_length - ctx_len), np.nan, dtype=np.float32)
+            ctx = np.concatenate([padding, ctx], axis=1)
+        elif ctx_len > context_length:
+            # Truncate from the left (keep the most recent context)
+            ctx = ctx[:, -context_length:]
+
+        # Every series is now exactly context_length + prediction_length steps
+        model_inputs.append({"target": np.concatenate([ctx, fut], axis=1)})
+
+    return model_inputs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Balancing and Shuffling
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -678,7 +734,19 @@ def prepare_inputs(
         f"Instruction pairs — Train: {len(train_pairs)} | Val: {len(val_pairs)}"
     )
 
-    return train_inputs, val_inputs, train_pairs, val_pairs
+    # ── Step 4: Convert pairs to fixed-length model inputs ───────────────── #
+    # Each entry is {'target': array(F, context_length + prediction_length)}.
+    # Short Type B contexts are NaN-padded on the left so the series is always
+    # exactly context_length + prediction_length long.  Pass these to
+    # pipeline.fit() with min_past=context_length to lock the cut point.
+    logger.info("Converting pairs to fixed-length model inputs (NaN-padding short contexts)...")
+    train_model_inputs = pairs_to_model_inputs(train_pairs, context_length)
+    val_model_inputs   = pairs_to_model_inputs(val_pairs,   context_length)
+    logger.info(
+        f"Model inputs — Train: {len(train_model_inputs)} | Val: {len(val_model_inputs)}"
+    )
+
+    return train_inputs, val_inputs, train_pairs, val_pairs, train_model_inputs, val_model_inputs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -814,7 +882,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    train_inputs, val_inputs, train_pairs, val_pairs = prepare_inputs(
+    train_inputs, val_inputs, train_pairs, val_pairs, train_model_inputs, val_model_inputs = prepare_inputs(
         data_dir=args.data_dir,
         min_length=args.min_length,
         val_fraction=args.val_fraction,
@@ -830,21 +898,29 @@ def main():
     #
     #  train_inputs.pkl / val_inputs.pkl
     #    Original format → list of {'target': array(F, T)}
-    #    Use directly with pipeline.fit() for baseline training
+    #    Use directly with pipeline.fit() for baseline (no instruction tuning)
     #
     #  train_pairs.pkl / val_pairs.pkl
-    #    Three-type instruction pairs for fine-tuning
+    #    Three-type instruction pairs for analysis/inspection
     #    Format: {'context': {'target': array(F, ctx)},
     #             'future':  {'target': array(F, pred)},
     #             'type':    str}
-    #    NOTE: Strip the 'type' key before passing to pipeline.fit()
+    #
+    #  train_model_inputs.pkl / val_model_inputs.pkl
+    #    Fixed-length inputs ready for pipeline.fit() — USE THESE for fine-tuning
+    #    Format: {'target': array(F, context_length + prediction_length)}
+    #    - Contexts shorter than context_length are NaN-padded on the left
+    #    - Pass to pipeline.fit() with min_past=context_length to guarantee
+    #      the cut always falls at the intended context/future boundary
     #
     # ─────────────────────────────────────────────────────────────────────── #
     files_to_save = {
-        "train_inputs.pkl": train_inputs,
-        "val_inputs.pkl"  : val_inputs,
-        "train_pairs.pkl" : train_pairs,
-        "val_pairs.pkl"   : val_pairs,
+        "train_inputs.pkl"      : train_inputs,
+        "val_inputs.pkl"        : val_inputs,
+        "train_pairs.pkl"       : train_pairs,
+        "val_pairs.pkl"         : val_pairs,
+        "train_model_inputs.pkl": train_model_inputs,
+        "val_model_inputs.pkl"  : val_model_inputs,
     }
 
     for filename, data in files_to_save.items():
