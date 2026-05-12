@@ -1,27 +1,30 @@
 """
-Data preparation script for fine-tuning Chronos-2 on mTSBench data.
+Two-stage data preparation for Chronos-2 anomaly fine-tuning on mTSBench.
 
 Loads all *test.csv files from the mTSBench dataset directory, extracts feature
 columns (excluding timestamp and is_anomaly), and saves train/val splits as
 pickle files ready for chronos2 pipeline.fit().
 
 NOTE: mTSBench *train.csv files contain only normal data (is_anomaly=0 throughout).
-Anomaly labels (required for Type B and C pairs) only exist in *test.csv files,
-so only those are loaded.
+Anomaly labels (required for Type B/C/D pairs) only exist in *test.csv files.
 
-Creates THREE types of instruction tuning pairs using anomaly ground truth labels:
+Creates FOUR types of instruction tuning pairs using anomaly ground truth labels.
+ALL pairs from each type are kept as-is (no balancing or downsampling) so that
+the raw pair counts per type are visible for analysis.
 
-  Type A — Normal-to-Normal   : context=normal, future=normal        (60% target)
-  Type B — Pre-Anomaly        : context=normal, future=anomaly onset  (30% target)
-  Type C — Anomaly-Context    : context=anomaly, future=normal        (10% target)
+  Stage 1 — normal futures (gradient descent, loss minimised):
+    Type A — Normal-to-Normal   : context=normal,  future=normal
+    Type C — Anomaly-Context    : context=anomaly, future=normal
 
-All pairs maintain the {'target': array(num_features, length)} format.
+  Stage 2 — anomalous futures (gradient ascent, loss maximised):
+    Type B — Pre-Anomaly        : context=normal,  future=anomaly onset
+    Type D — Anomaly-to-Anomaly : context=anomaly, future=anomaly
+
+At inference time, high prediction error on a region => high anomaly score.
 
 Usage:
-    python prepare_data.py [--data_dir ...] [--output_dir ...] [--min_length ...]
-                           [--val_fraction ...] [--context_length ...]
-                           [--prediction_length ...] [--stride ...]
-                           [--ratio_a ...] [--ratio_b ...] [--ratio_c ...]
+    python inst_data_prepare.py [--data_dir ...] [--output_dir ...]
+                                [--pre_anomaly_offsets 1 16 32 64 128]
 """
 
 import argparse
@@ -33,17 +36,12 @@ import pickle
 import numpy as np
 import pandas as pd
 
-
 log_path = os.path.join("./prepared_data/log", "prepare_data.log")
 os.makedirs(os.path.dirname(log_path), exist_ok=True)
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(log_path),
-    ]
+    handlers=[logging.StreamHandler(), logging.FileHandler(log_path)],
 )
 logger = logging.getLogger(__name__)
 
@@ -52,37 +50,24 @@ logger = logging.getLogger(__name__)
 #  Data Loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_csv_as_multivariate(
-    csv_path: str,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+def load_csv_as_multivariate(csv_path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
     """
-    Load one *train.csv file.
+    Load one *test.csv file.
 
     Returns
     -------
-    features       : float32 array of shape (n_variates, time_steps)
-                     Only feature columns — timestamp and is_anomaly excluded.
-    anomaly_labels : int32 array of shape (time_steps,)
-                     1 = anomaly, 0 = normal.
-                     All zeros if 'is_anomaly' column is absent.
+    features : float32 array (n_variates, time_steps) — timestamp/is_anomaly excluded.
+    labels   : int32 array (time_steps,), 1=anomaly 0=normal (all-zero if column absent).
     """
     df = pd.read_csv(csv_path)
     feature_cols = [c for c in df.columns if c not in ("timestamp", "is_anomaly")]
-
     if not feature_cols:
         return None, None
-
     try:
         features = df[feature_cols].values.T.astype(np.float32)
-
-        if "is_anomaly" in df.columns:
-            anomaly_labels = df["is_anomaly"].values.astype(np.int32)
-        else:
-            # No label column — treat entire series as normal
-            anomaly_labels = np.zeros(df.shape[0], dtype=np.int32)
-
-        return features, anomaly_labels
-
+        labels = df["is_anomaly"].values.astype(np.int32) if "is_anomaly" in df.columns \
+            else np.zeros(df.shape[0], dtype=np.int32)
+        return features, labels
     except Exception as e:
         logger.warning(f"Error processing {csv_path}: {e}")
         return None, None
@@ -92,69 +77,79 @@ def load_csv_as_multivariate(
 #  Anomaly Boundary Extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_anomaly_boundaries(
-    anomaly_labels: np.ndarray,
-) -> list[tuple[int, int]]:
+def extract_anomaly_boundaries(labels: np.ndarray) -> list[tuple[int, int]]:
     """
     Find contiguous anomaly regions from the binary label array.
 
-    Returns
-    -------
-    List of (start, end) tuples where is_anomaly == 1.
-    End index is EXCLUSIVE (Python-slice style).
-
-    Example
-    -------
-    labels = [0,0,0,1,1,1,0,0,1,1,0]
-    returns [(3, 6), (8, 10)]
+    Returns list of (start, end) where end is EXCLUSIVE (Python-slice style).
+    Example: [0,0,0,1,1,1,0,0,1,1,0] → [(3,6), (8,10)]
     """
-    boundaries = []
-    in_anomaly = False
-    start = 0
-
-    for i, label in enumerate(anomaly_labels):
-        if label == 1 and not in_anomaly:
-            in_anomaly = True
-            start = i
-        elif label == 0 and in_anomaly:
-            in_anomaly = False
+    boundaries, in_anom, start = [], False, 0
+    for i, v in enumerate(labels):
+        if v == 1 and not in_anom:
+            in_anom, start = True, i
+        elif v == 0 and in_anom:
+            in_anom = False
             boundaries.append((start, i))
-
-    # Handle series that ends while still in anomaly
-    if in_anomaly:
-        boundaries.append((start, len(anomaly_labels)))
-
+    if in_anom:
+        boundaries.append((start, len(labels)))
     return boundaries
 
 
-def get_normal_zones(
-    anomaly_boundaries: list[tuple[int, int]],
-    total_length: int,
-) -> list[tuple[int, int]]:
+def get_normal_zones(boundaries: list[tuple[int, int]], total: int) -> list[tuple[int, int]]:
     """
-    Return the normal (non-anomaly) zones as (start, end) pairs.
+    Return normal (non-anomaly) zones as (start, end) pairs.
 
-    These are the gaps between anomalies, plus the leading and trailing
-    normal segments at the edges of the series.
-
-    Example
-    -------
-    anomaly_boundaries = [(3, 6), (8, 10)], total_length = 12
-    returns [(0, 3), (6, 8), (10, 12)]
+    Example: boundaries=[(3,6),(8,10)], total=12 → [(0,3),(6,8),(10,12)]
     """
-    normal_zones = []
-    prev_end = 0
+    zones, prev = [], 0
+    for s, e in boundaries:
+        if s > prev:
+            zones.append((prev, s))
+        prev = e
+    if prev < total:
+        zones.append((prev, total))
+    return zones
 
-    for anom_start, anom_end in anomaly_boundaries:
-        if anom_start > prev_end:
-            normal_zones.append((prev_end, anom_start))
-        prev_end = anom_end
 
-    # Trailing normal zone after last anomaly
-    if prev_end < total_length:
-        normal_zones.append((prev_end, total_length))
+def extract_normal_signal(
+    data: np.ndarray,
+    normal_zones: list[tuple[int, int]],
+    length: int,
+) -> np.ndarray | None:
+    """
+    Return a (F, length) reference normal signal sampled from the series' normal zones.
 
-    return normal_zones
+    Strategy:
+      1. If a single normal zone is long enough, take its last `length` timesteps.
+      2. Otherwise concatenate normal zones (longest first) until we have enough.
+      3. If still short, left-pad with NaN — the model masks NaN inputs out.
+
+    Returns None if there are no normal zones at all.
+    """
+    if not normal_zones:
+        return None
+
+    sorted_zones = sorted(normal_zones, key=lambda z: z[1] - z[0], reverse=True)
+    s, e = sorted_zones[0]
+    if e - s >= length:
+        return data[:, e - length:e].astype(np.float32, copy=False)
+
+    chunks = []
+    collected = 0
+    for s, e in sorted_zones:
+        chunks.append(data[:, s:e])
+        collected += e - s
+        if collected >= length:
+            break
+
+    combined = np.concatenate(chunks, axis=1).astype(np.float32, copy=False)
+    if combined.shape[1] >= length:
+        return combined[:, -length:]
+
+    F = combined.shape[0]
+    pad = np.full((F, length - combined.shape[1]), np.nan, dtype=np.float32)
+    return np.concatenate([pad, combined], axis=1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,46 +164,22 @@ def create_type_a_pairs(
     stride: int,
 ) -> list[dict]:
     """
-    Type A — Normal-to-Normal instances.
+    Type A — Normal-to-Normal.
 
-    Sliding window is applied ONLY within normal zones.
-    Both context and future are guaranteed to be anomaly-free.
-
-    Teaches the model: "this is what normal continuation looks like."
-
-    Parameters
-    ----------
-    data         : feature array, shape (num_features, time_steps)
-    normal_zones : list of (start, end) for normal regions
+    Sliding window applied ONLY within normal zones; both context and future
+    are guaranteed anomaly-free. Teaches the model what normal continuation looks like.
     """
-    pairs = []
-    window_size = context_length + prediction_length
-
-    for zone_start, zone_end in normal_zones:
-        zone_length = zone_end - zone_start
-
-        # Zone must fit at least one full window
-        if zone_length < window_size:
-            logger.debug(
-                f"Normal zone [{zone_start}, {zone_end}] too short "
-                f"(length={zone_length}, need={window_size}). Skipping."
-            )
+    pairs, win = [], context_length + prediction_length
+    for zs, ze in normal_zones:
+        if ze - zs < win:
             continue
-
-        for start in range(zone_start, zone_end - window_size + 1, stride):
-            context_end = start + context_length
-            future_end  = context_end + prediction_length
-
-            # Guard: future must not spill outside the normal zone
-            if future_end > zone_end:
+        for s in range(zs, ze - win + 1, stride):
+            ce = s + context_length
+            if ce + prediction_length > ze:
                 break
-
-            pairs.append({
-                "context": {"target": data[:, start:context_end]},
-                "future" : {"target": data[:, context_end:future_end]},
-                "type"   : "normal_to_normal",
-            })
-
+            pairs.append({"context": {"target": data[:, s:ce]},
+                          "future":  {"target": data[:, ce:ce + prediction_length]},
+                          "type": "normal_to_normal"})
     return pairs
 
 
@@ -218,72 +189,56 @@ def create_type_a_pairs(
 
 def create_type_b_pairs(
     data: np.ndarray,
-    anomaly_labels: np.ndarray,
-    anomaly_boundaries: list[tuple[int, int]],
+    labels: np.ndarray,
+    boundaries: list[tuple[int, int]],
     context_length: int,
     prediction_length: int,
     pre_anomaly_offsets: list[int],
 ) -> list[dict]:
     """
-    Type B — Pre-Anomaly instances.
+    Type B — Pre-Anomaly (normal context → anomaly onset).
 
-    Context is entirely in the normal zone immediately before an anomaly.
-    Future window begins just before (or at) the anomaly onset and extends
-    into it by 'offset' steps.
-
-    Multiple offset values produce multiple pairs per anomaly event,
-    which is critical because anomalies are rare in the dataset.
-
-    Teaches the model: "given normal history, the correct future is still
-    normal" — the gap between prediction and actual anomalous values
+    Context is entirely normal; future window begins just before the anomaly onset
+    and extends into it by 'offset' steps. Multiple offsets per event compensate
+    for anomaly rarity. The gap between model prediction and actual anomalous values
     becomes the anomaly detection signal at inference time.
 
-    Parameters
-    ----------
-    pre_anomaly_offsets : list of int
-        How many steps INTO the anomaly the future window's end reaches.
-        offset=1            -> future mostly normal, 1 anomaly step at end.
-        offset=pred_length  -> future fully inside anomaly region.
+    pre_anomaly_offsets : steps INTO the anomaly the future window's end reaches.
     """
-    pairs = []
-    total_length = len(anomaly_labels)
+    pairs, total = [], len(labels)
+    seen: set[tuple[int, int, int, int]] = set()
 
-    for anom_idx, (anom_start, anom_end) in enumerate(anomaly_boundaries):
-
-        # Safe start of the preceding normal zone
-        preceding_normal_start = anomaly_boundaries[anom_idx - 1][1] if anom_idx > 0 else 0
+    for idx, (anom_s, anom_e) in enumerate(boundaries):
+        prev_end = boundaries[idx - 1][1] if idx > 0 else 0
+        anom_len = anom_e - anom_s
 
         for offset in pre_anomaly_offsets:
-
-            # Future window: ends 'offset' steps into the anomaly
-            future_end   = anom_start + offset
-            future_start = future_end - prediction_length
-            context_end  = future_start
-
-            # ── Boundary checks ───────────────────────────────────────────── #
-            # Clamp context_start to the available normal zone; this allows
-            # shorter-than-context_length contexts when the anomaly occurs early
-            # in the series or close after a previous anomaly.
-            context_start = max(context_end - context_length,
-                                preceding_normal_start, 0)
-
-            # Skip if the available normal context is too short to be useful
-            if context_end <= 0 or (context_end - context_start) < prediction_length:
+            # Clamp offset to the actual anomaly length so the future window never
+            # spills past this anomaly's end into a subsequent normal or anomaly region.
+            effective_offset = min(offset, anom_len)
+            if effective_offset <= 0:
                 continue
 
-            if future_end > total_length:
-                continue                           # future goes beyond series end
-
-            # Context must be entirely normal (hard constraint)
-            if np.any(anomaly_labels[context_start:context_end] == 1):
+            fe = anom_s + effective_offset
+            fs = fe - prediction_length
+            ce = fs
+            # Clamp context start to the available normal zone
+            cs = max(ce - context_length, prev_end, 0)
+            if ce <= 0 or (ce - cs) < prediction_length or fe > total:
+                continue
+            if np.any(labels[cs:ce] == 1):   # context must be entirely normal
                 continue
 
-            pairs.append({
-                "context": {"target": data[:, context_start:context_end]},
-                "future" : {"target": data[:, future_start:future_end]},
-                "type"   : "pre_anomaly",
-            })
+            # Clamping can map multiple offsets to the same window for short anomalies;
+            # skip duplicates to avoid redundant training examples.
+            key = (cs, ce, fs, fe)
+            if key in seen:
+                continue
+            seen.add(key)
 
+            pairs.append({"context": {"target": data[:, cs:ce]},
+                          "future":  {"target": data[:, fs:fe]},
+                          "type": "pre_anomaly"})
     return pairs
 
 
@@ -293,77 +248,98 @@ def create_type_b_pairs(
 
 def create_type_c_pairs(
     data: np.ndarray,
-    anomaly_labels: np.ndarray,
-    anomaly_boundaries: list[tuple[int, int]],
+    labels: np.ndarray,
+    boundaries: list[tuple[int, int]],
     context_length: int,
     prediction_length: int,
     normal_lead: int,
     normal_tail: int,
 ) -> list[dict]:
     """
-    Type C — Anomaly-Context instances.
+    Type C — Anomaly-Context (anomaly context → normal future).
 
-    Context window CONTAINS the anomaly event (with a normal lead-in and
-    normal tail after it). Future window is the post-anomaly normal behavior.
+    Context window CONTAINS the anomaly event (with a normal lead-in and tail).
+    Future window is post-anomaly normal behavior. Teaches the model what recovery
+    looks like and prevents confusing anomaly residuals with normal patterns.
 
-    Teaches the model: "after an anomaly, what does recovery look like."
-    Also prevents the model from confusing anomaly residuals with normal patterns.
-
-    Parameters
-    ----------
-    normal_lead : int
-        Normal timesteps BEFORE the anomaly to include in the context window.
-    normal_tail : int
-        Normal timesteps AFTER the anomaly to include in the context window,
-        before the future window begins.
+    normal_lead : normal timesteps BEFORE the anomaly to include in context.
+    normal_tail : normal timesteps AFTER the anomaly before the future window starts.
     """
-    pairs = []
-    total_length = len(anomaly_labels)
-
-    for anom_idx, (anom_start, anom_end) in enumerate(anomaly_boundaries):
-
-        # ── Build context window ─────────────────────────────────────────── #
+    pairs, total = [], len(labels)
+    for idx, (anom_s, anom_e) in enumerate(boundaries):
         # Cap context_end so the future window always fits inside the series.
-        # Without this cap, context_end = context_start + context_length can
-        # push future_end beyond total_length, silently dropping all Type C
-        # pairs for anomalies near the end of the series.
-        max_context_end = total_length - prediction_length
-        context_end = min(anom_end + normal_tail, max_context_end)
-
-        if context_end <= anom_start:
+        max_ce = total - prediction_length
+        ce = min(anom_e + normal_tail, max_ce)
+        if ce <= anom_s:
             continue                              # anomaly too close to series end
 
-        context_start = max(0, context_end - context_length)
-        context_end   = context_start + context_length  # exact length (safe: total_length >= ctx+pred)
+        cs = max(0, ce - context_length)
+        ce = cs + context_length                  # normalise to exact context_length
 
-        # ── Build future window ──────────────────────────────────────────── #
-        future_start = context_end
-        future_end   = future_start + prediction_length
-
-        # ── Boundary checks ──────────────────────────────────────────────── #
-        if future_end > total_length:
-            continue                              # not enough series after anomaly
-
-        # Context must actually contain the anomaly
-        if not np.any(anomaly_labels[context_start:context_end] == 1):
+        # Enforce normal_lead: context must have at least normal_lead normal steps
+        # before the anomaly starts, otherwise the lead-in is uninformative.
+        if anom_s - cs < normal_lead:
             continue
 
-        # Future must not overlap with the NEXT anomaly
-        if anom_idx + 1 < len(anomaly_boundaries):
-            next_anom_start = anomaly_boundaries[anom_idx + 1][0]
-            if future_end > next_anom_start:
-                continue
-
-        # Future must be entirely normal
-        if np.any(anomaly_labels[future_start:future_end] == 1):
+        # Skip pairs where the normalised ce has drifted far past the intended
+        # anom_e + normal_tail boundary (happens when the anomaly is early in the
+        # series and cs clamps to 0, pushing ce to context_length). In that case
+        # the future window starts hundreds of steps after the anomaly rather than
+        # normal_tail steps, defeating the purpose of this pair type.
+        if ce > anom_e + normal_tail + context_length // 2:
             continue
 
-        pairs.append({
-            "context": {"target": data[:, context_start:context_end]},
-            "future" : {"target": data[:, future_start:future_end]},
-            "type"   : "anomaly_context",
-        })
+        fs, fe = ce, ce + prediction_length
+        if not np.any(labels[cs:ce] == 1):        # context must contain the anomaly
+            continue
+        if idx + 1 < len(boundaries) and fe > boundaries[idx + 1][0]:
+            continue                              # future must not reach next anomaly
+        if np.any(labels[fs:fe] == 1):            # future must be entirely normal
+            continue
+        pairs.append({"context": {"target": data[:, cs:ce]},
+                      "future":  {"target": data[:, fs:fe]},
+                      "type": "anomaly_context"})
+    return pairs
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Type D — Anomaly-to-Anomaly Pairs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_type_d_pairs(
+    data: np.ndarray,
+    labels: np.ndarray,
+    context_length: int,
+    prediction_length: int,
+    stride: int,
+) -> list[dict]:
+    """
+    Type D — Anomaly-to-Anomaly.
+
+    Sliding window; kept only when BOTH context and future contain anomalous
+    timesteps. Covers two natural scenarios:
+      1. A long anomaly spanning both windows.
+      2. Adjacent anomalies — context contains one event, future reaches the next.
+
+    The future must contain at least prediction_length // 4 anomalous steps.
+    Using np.any (1 step minimum) would admit futures that are overwhelmingly
+    normal, diluting the Stage 2 gradient-ascent signal and causing the model
+    to learn high error on normal timesteps — the opposite of the intent.
+
+    Used exclusively in Stage 2 (gradient ascent).
+    """
+    pairs, win = [], context_length + prediction_length
+    # Minimum anomaly content required in the future window so that gradient
+    # ascent is dominated by anomalous timesteps, not normal ones.
+    min_fut_anom = max(1, prediction_length // 4)
+
+    for s in range(0, data.shape[1] - win + 1, stride):
+        ce, fe = s + context_length, s + win
+        if (np.any(labels[s:ce])
+                and np.sum(labels[ce:fe]) >= min_fut_anom):
+            pairs.append({"context": {"target": data[:, s:ce]},
+                          "future":  {"target": data[:, ce:fe]},
+                          "type": "anomaly_to_anomaly"})
     return pairs
 
 
@@ -374,425 +350,287 @@ def create_type_c_pairs(
 def pairs_to_model_inputs(
     pairs: list[dict],
     context_length: int,
+    normal_signal_length: int = 0,
 ) -> list[dict]:
     """
-    Convert instruction pairs into model-ready inputs for pipeline.fit().
+    Convert instruction pairs to fixed-length model inputs for pipeline.fit().
 
-    Why NaN-padding is necessary
-    -----------------------------
-    Chronos2Dataset randomly picks a cut point (slice_idx) from the range
-    [min_past, series_length - prediction_length].  When pipeline.fit() is
-    called with min_past=context_length, that range collapses to a single
-    value — context_length — so the cut is always exactly at the intended
-    context/future boundary.
+    When `normal_signal_length > 0`, each pair must contain a `normal_signal` field
+    of shape (F, normal_signal_length). The output `target` is laid out as:
 
-    This only works if EVERY series is exactly context_length + prediction_length
-    long.  Type B pairs can have a shorter context (the anomaly may occur close
-    to the start of the normal zone), so we left-pad those with NaN.  The model
-    already masks NaN positions via context_mask, so the padding is invisible
-    to the loss computation.
+        [normal_signal (N) | context (C) | future (P)]
 
-    Parameters
-    ----------
-    pairs          : list of dicts with 'context' and 'future' keys produced
-                     by build_pairs_for_series()
-    context_length : the fixed context length used during data preparation
+    so the total target length is N + C + P. At training time, set
+    `context_length = N + C` and `min_past = N + C` so that the dataset slices
+    exactly at the future boundary, and pass `sep_patch_index = N // input_patch_size`
+    to the model so it inserts [SEP] between the normal and context patches.
 
-    Returns
-    -------
-    list of {'target': array(F, context_length + prediction_length)} dicts
-    ready to be passed directly to pipeline.fit(..., min_past=context_length)
+    Short Type B contexts are NaN-padded on the left so the model masks them out.
     """
-    model_inputs = []
+    out = []
     for p in pairs:
-        ctx = p["context"]["target"]   # (F, ctx_len), may be < context_length for Type B
-        fut = p["future"]["target"]    # (F, prediction_length)
-
-        F, ctx_len = ctx.shape
-        if ctx_len < context_length:
-            # Left-pad with NaN; the model masks these positions automatically
-            padding = np.full((F, context_length - ctx_len), np.nan, dtype=np.float32)
-            ctx = np.concatenate([padding, ctx], axis=1)
-        elif ctx_len > context_length:
-            # Truncate from the left (keep the most recent context)
+        ctx, fut = p["context"]["target"], p["future"]["target"]
+        F, clen = ctx.shape
+        if clen < context_length:
+            pad = np.full((F, context_length - clen), np.nan, dtype=np.float32)
+            ctx = np.concatenate([pad, ctx], axis=1)
+        elif clen > context_length:
             ctx = ctx[:, -context_length:]
 
-        # Every series is now exactly context_length + prediction_length steps
-        model_inputs.append({"target": np.concatenate([ctx, fut], axis=1)})
+        if normal_signal_length > 0:
+            normal = p.get("normal_signal", None)
+            if normal is None:
+                # No normal zone available for this series — fill with NaN; model masks it out.
+                normal = np.full((F, normal_signal_length), np.nan, dtype=np.float32)
+            elif normal.shape[1] != normal_signal_length:
+                raise ValueError(
+                    f"normal_signal length {normal.shape[1]} != expected {normal_signal_length}"
+                )
+            target = np.concatenate([normal, ctx, fut], axis=1)
+        else:
+            target = np.concatenate([ctx, fut], axis=1)
 
-    return model_inputs
+        out.append({"target": target})
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Balancing and Shuffling
+#  Stage-Specific Per-Series Pair Construction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def balance_and_shuffle(
-    type_a_pairs: list[dict],
-    type_b_pairs: list[dict],
-    type_c_pairs: list[dict],
-    ratio_a: float,
-    ratio_b: float,
-    ratio_c: float,
-    rng: np.random.Generator,
+def _attach_normal_signal(pairs: list[dict], normal_sig: np.ndarray | None) -> None:
+    """In-place: add the same per-series normal_signal reference to every pair."""
+    for p in pairs:
+        p["normal_signal"] = normal_sig
+
+
+def build_stage1_pairs(
+    data: np.ndarray,
+    labels: np.ndarray,
+    context_length: int,
+    prediction_length: int,
+    stride: int,
+    normal_lead: int,
+    normal_tail: int,
+    normal_signal_length: int = 0,
 ) -> list[dict]:
     """
-    Balance the three types to the target ratio, then shuffle.
+    Stage 1 — ALL pairs with NORMAL futures (gradient descent).
 
-    Strategy:
-      - Type B and C are rare — always keep ALL of them.
-      - Type A is abundant — downsample to match the target ratio
-        relative to how many B and C pairs are available.
+    Type A: context=normal,  future=normal
+    Type C: context=anomaly, future=normal
 
-    Parameters
-    ----------
-    ratio_a / ratio_b / ratio_c : target proportions, must sum to 1.0
+    Returns every pair produced by both types with no downsampling, so the
+    raw counts are preserved for analysis.
     """
-    n_a = len(type_a_pairs)
-    n_b = len(type_b_pairs)
-    n_c = len(type_c_pairs)
-
-    logger.info(
-        f"  Before balancing — "
-        f"A (normal): {n_a}  B (pre-anom): {n_b}  C (anom-ctx): {n_c}  "
-        f"| target {ratio_a:.0%}/{ratio_b:.0%}/{ratio_c:.0%}"
-    )
-
-    # Edge case: no rare pairs — return all Type A unbalanced
-    if n_b == 0 and n_c == 0:
-        logger.warning(
-            "No Type B or C pairs found for this series. "
-            "Returning all Type A pairs. "
-            "Check if is_anomaly column exists and has positive labels."
-        )
-        return [type_a_pairs[i] for i in rng.permutation(n_a)]
-
-    # Determine target counts to satisfy the ratio.
-    # Two cases:
-    #   (a) A is abundant  → downsample A, keep all B and C.
-    #   (b) A is limiting  → keep all A, downsample B and C proportionally.
-    # This ensures the per-series ratio is always close to the target,
-    # preventing B/C from dominating when A pairs are scarce.
-    rare_total = n_b + n_c
-    rare_ratio = ratio_b + ratio_c
-    n_a_target = int(rare_total * ratio_a / rare_ratio) if rare_ratio > 0 else n_a
-
-    if n_a >= n_a_target:
-        # Case (a): enough A — downsample A, keep all B and C
-        n_a_sampled = n_a_target
-        n_b_sampled = n_b
-        n_c_sampled = n_c
-    else:
-        # Case (b): A is the bottleneck — scale B and C down to match
-        n_a_sampled = n_a
-        n_b_sampled = min(n_b, int(n_a * ratio_b / ratio_a))
-        n_c_sampled = min(n_c, int(n_a * ratio_c / ratio_a))
-
-    a_indices = rng.choice(n_a, size=n_a_sampled, replace=False)
-    b_indices = rng.choice(n_b, size=n_b_sampled, replace=False)
-    c_indices = rng.choice(n_c, size=n_c_sampled, replace=False)
-
-    final_pairs = (
-        [type_a_pairs[i] for i in a_indices]
-        + [type_b_pairs[i] for i in b_indices]
-        + [type_c_pairs[i] for i in c_indices]
-    )
-
-    logger.info(
-        f"  After  balancing — "
-        f"A: {n_a_sampled}  B: {n_b_sampled}  C: {n_c_sampled}  Total: {len(final_pairs)}"
-    )
-
-    # Shuffle so all types are interleaved during training
-    return [final_pairs[i] for i in rng.permutation(len(final_pairs))]
+    bounds = extract_anomaly_boundaries(labels)
+    zones  = get_normal_zones(bounds, len(labels))
+    type_a = create_type_a_pairs(data, zones, context_length, prediction_length, stride)
+    type_c = create_type_c_pairs(data, labels, bounds, context_length, prediction_length,
+                                  normal_lead, normal_tail)
+    pairs = type_a + type_c
+    if normal_signal_length > 0:
+        normal_sig = extract_normal_signal(data, zones, normal_signal_length)
+        _attach_normal_signal(pairs, normal_sig)
+    logger.debug(f"  Stage 1 — A: {len(type_a)}  C: {len(type_c)}")
+    return pairs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Per-Series Pair Construction
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_pairs_for_series(
+def build_stage2_pairs(
     data: np.ndarray,
-    anomaly_labels: np.ndarray,
+    labels: np.ndarray,
     context_length: int,
     prediction_length: int,
     stride: int,
     pre_anomaly_offsets: list[int],
-    normal_lead: int,
-    normal_tail: int,
-    ratio_a: float,
-    ratio_b: float,
-    ratio_c: float,
-    rng: np.random.Generator,
+    normal_signal_length: int = 0,
 ) -> list[dict]:
     """
-    Build all three types of instruction pairs for a single time series,
-    then balance and shuffle.
+    Stage 2 — ALL pairs with ANOMALOUS futures (gradient ascent).
 
-    Parameters
-    ----------
-    data           : feature array, shape (num_features, time_steps)
-    anomaly_labels : binary label array, shape (time_steps,)
+    Type B: context=normal,  future=anomaly onset
+    Type D: context=anomaly, future=anomaly
 
-    Returns
-    -------
-    Balanced and shuffled list of instruction pair dicts.
-    Each dict has keys: 'context', 'future', 'type'
-      - 'context' and 'future' each contain {'target': array(F, length)}
-      - 'type' is for analysis only — strip before passing to pipeline.fit()
+    Returns every pair produced by both types with no downsampling, so the
+    raw counts are preserved for analysis.
     """
-    anomaly_boundaries = extract_anomaly_boundaries(anomaly_labels)
-    normal_zones       = get_normal_zones(anomaly_boundaries, len(anomaly_labels))
-
-    logger.debug(
-        f"  Anomaly events: {len(anomaly_boundaries)} | "
-        f"Normal zones: {len(normal_zones)}"
-    )
-
-    type_a = create_type_a_pairs(
-        data=data,
-        normal_zones=normal_zones,
-        context_length=context_length,
-        prediction_length=prediction_length,
-        stride=stride,
-    )
-
-    type_b = create_type_b_pairs(
-        data=data,
-        anomaly_labels=anomaly_labels,
-        anomaly_boundaries=anomaly_boundaries,
-        context_length=context_length,
-        prediction_length=prediction_length,
-        pre_anomaly_offsets=pre_anomaly_offsets,
-    )
-
-    type_c = create_type_c_pairs(
-        data=data,
-        anomaly_labels=anomaly_labels,
-        anomaly_boundaries=anomaly_boundaries,
-        context_length=context_length,
-        prediction_length=prediction_length,
-        normal_lead=normal_lead,
-        normal_tail=normal_tail,
-    )
-
-    return balance_and_shuffle(
-        type_a_pairs=type_a,
-        type_b_pairs=type_b,
-        type_c_pairs=type_c,
-        ratio_a=ratio_a,
-        ratio_b=ratio_b,
-        ratio_c=ratio_c,
-        rng=rng,
-    )
+    bounds = extract_anomaly_boundaries(labels)
+    type_b = create_type_b_pairs(data, labels, bounds, context_length, prediction_length,
+                                  pre_anomaly_offsets)
+    type_d = create_type_d_pairs(data, labels, context_length, prediction_length, stride)
+    pairs = type_b + type_d
+    if normal_signal_length > 0:
+        zones = get_normal_zones(bounds, len(labels))
+        normal_sig = extract_normal_signal(data, zones, normal_signal_length)
+        _attach_normal_signal(pairs, normal_sig)
+    logger.debug(f"  Stage 2 — B: {len(type_b)}  D: {len(type_d)}")
+    return pairs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main Preparation Pipeline
+#  Two-Stage Preparation Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def prepare_inputs(
+def prepare_two_stage_inputs(
     data_dir: str,
     min_length: int,
     val_fraction: float,
     context_length: int,
     prediction_length: int,
     stride: int,
-    ratio_a: float,
-    ratio_b: float,
-    ratio_c: float,
+    pre_anomaly_offsets: list[int],
     seed: int = 42,
+    normal_signal_length: int = 0,
 ):
     """
-    Full pipeline:
-      1. Load all *train.csv files (features + anomaly labels separately)
-      2. Split into train / val at the series level
-      3. For each split, build three-type instruction pairs per series
-      4. Return raw series lists and instruction pair lists
+    Produce separate Stage 1 and Stage 2 datasets for two-stage anomaly fine-tuning.
+
+    Stage 1 — NORMAL futures (gradient descent, loss minimised):
+        Type A: normal context  → normal future
+        Type C: anomaly context → normal future
+
+    Stage 2 — ANOMALOUS futures (gradient ascent, loss maximised):
+        Type B: normal context  → anomaly future (onset)
+        Type D: anomaly context → anomaly future
+
+    All pairs are kept as-is — no balancing or downsampling — so raw type counts
+    are visible in the statistics log.
 
     Returns
     -------
-    train_inputs : list of {'target': array(F, T)}  — original format
-    val_inputs   : list of {'target': array(F, T)}  — original format
-    train_pairs  : list of {'context':..., 'future':..., 'type':...}
-    val_pairs    : list of {'context':..., 'future':..., 'type':...}
+    train_inputs, val_inputs,
+    s1_train_pairs, s1_val_pairs, s2_train_pairs, s2_val_pairs,
+    s1_train_model_inputs, s1_val_model_inputs,
+    s2_train_model_inputs, s2_val_model_inputs
     """
     rng = np.random.default_rng(seed)
 
-    # Use only *test.csv files: these carry the anomaly labels (is_anomaly=1)
-    # required for Type B and Type C pair generation.
-    csv_files = sorted(
-        glob.glob(os.path.join(data_dir, "**", "*test.csv"), recursive=True)
-    )
+    csv_files = sorted(glob.glob(os.path.join(data_dir, "**", "*test.csv"), recursive=True))
     logger.info(f"Found {len(csv_files)} *test.csv files under {data_dir}")
-
-    # Pre-anomaly offsets: multiple windows per anomaly event
-    # Covers the full spectrum from "barely touching" to "fully inside" anomaly
-    pre_anomaly_offsets = sorted(set([
-        1,
-        max(1, prediction_length // 4),
-        max(1, prediction_length // 2),
-        prediction_length,
-    ]))
-    logger.info(f"Pre-anomaly offsets (Type B): {pre_anomaly_offsets}")
 
     # Normal lead/tail for Type C context construction
     normal_lead = max(10, context_length // 4)
     normal_tail = max(5,  prediction_length // 4)
+    logger.info(f"Pre-anomaly offsets (Type B): {pre_anomaly_offsets}")
     logger.info(f"Type C — normal_lead={normal_lead}, normal_tail={normal_tail}")
 
-    # ── Step 1: Load all CSVs ────────────────────────────────────────────── #
-    all_inputs         = []   # list of {'target': array(F, T)}
-    all_anomaly_labels = []   # parallel list of anomaly label arrays
-    skipped = 0
-
-    min_required = max(min_length, context_length + prediction_length)
-
+    # ── Load all CSVs ────────────────────────────────────────────────────── #
+    all_inputs, all_labels, skipped = [], [], 0
+    min_req = max(min_length, context_length + prediction_length)
     for path in csv_files:
         try:
-            features, anomaly_labels = load_csv_as_multivariate(path)
-
-            if features is None or features.shape[1] < min_required:
+            feat, lbl = load_csv_as_multivariate(path)
+            if feat is None or feat.shape[1] < min_req:
                 logger.debug(
                     f"Skipping {os.path.basename(path)}: "
-                    f"length={features.shape[1] if features is not None else 'None'}, "
-                    f"required={min_required}"
+                    f"length={feat.shape[1] if feat is not None else 'None'}, required={min_req}"
                 )
                 skipped += 1
                 continue
-
-            all_inputs.append({"target": features})
-            all_anomaly_labels.append(anomaly_labels)
-
+            all_inputs.append({"target": feat})
+            all_labels.append(lbl)
         except Exception as exc:
             logger.warning(f"Skipping {path}: {exc}")
             skipped += 1
-
     logger.info(f"Usable series: {len(all_inputs)}  (skipped {skipped})")
-
-    if len(all_inputs) == 0:
+    if not all_inputs:
         raise ValueError("No usable series found. Check data_dir and min_length.")
 
-    # ── Step 2: Train / Val split ────────────────────────────────────────── #
+    # ── Train / Val split ────────────────────────────────────────────────── #
     idx     = rng.permutation(len(all_inputs))
     n_val   = max(1, int(len(all_inputs) * val_fraction))
     val_set = set(idx[:n_val].tolist())
-
-    train_inputs = [all_inputs[i]         for i in range(len(all_inputs)) if i not in val_set]
-    val_inputs   = [all_inputs[i]         for i in val_set]
-    train_labels = [all_anomaly_labels[i] for i in range(len(all_inputs)) if i not in val_set]
-    val_labels   = [all_anomaly_labels[i] for i in val_set]
-
+    train_inputs = [all_inputs[i] for i in range(len(all_inputs)) if i not in val_set]
+    val_inputs   = [all_inputs[i] for i in val_set]
+    train_labels = [all_labels[i] for i in range(len(all_inputs)) if i not in val_set]
+    val_labels   = [all_labels[i] for i in val_set]
     logger.info(f"Train series: {len(train_inputs)} | Val series: {len(val_inputs)}")
 
-    # ── Step 3: Build instruction pairs ─────────────────────────────────── #
-    logger.info(
-        f"Building instruction pairs — "
-        f"context={context_length}, pred={prediction_length}, stride={stride}, "
-        f"ratio A/B/C = {ratio_a:.0%}/{ratio_b:.0%}/{ratio_c:.0%}"
-    )
+    # ── Build stage-specific pairs (all pairs, no balancing) ─────────────── #
+    common = dict(context_length=context_length, prediction_length=prediction_length,
+                  stride=stride)
 
-    train_pairs = []
-    for i, (series, labels) in enumerate(zip(train_inputs, train_labels)):
-        logger.debug(f"Train series {i+1}/{len(train_inputs)}")
-        pairs = build_pairs_for_series(
-            data=series["target"],
-            anomaly_labels=labels,
-            context_length=context_length,
-            prediction_length=prediction_length,
-            stride=stride,
-            pre_anomaly_offsets=pre_anomaly_offsets,
-            normal_lead=normal_lead,
-            normal_tail=normal_tail,
-            ratio_a=ratio_a,
-            ratio_b=ratio_b,
-            ratio_c=ratio_c,
-            rng=rng,
-        )
-        train_pairs.extend(pairs)
+    s1_tr, s2_tr = [], []
+    for i, (series, lbl) in enumerate(zip(train_inputs, train_labels)):
+        logger.debug(f"Train series {i + 1}/{len(train_inputs)}")
+        s1_tr.extend(build_stage1_pairs(series["target"], lbl, **common,
+                                         normal_lead=normal_lead, normal_tail=normal_tail,
+                                         normal_signal_length=normal_signal_length))
+        s2_tr.extend(build_stage2_pairs(series["target"], lbl, **common,
+                                         pre_anomaly_offsets=pre_anomaly_offsets,
+                                         normal_signal_length=normal_signal_length))
 
-    val_pairs = []
-    for i, (series, labels) in enumerate(zip(val_inputs, val_labels)):
-        logger.debug(f"Val series {i+1}/{len(val_inputs)}")
-        pairs = build_pairs_for_series(
-            data=series["target"],
-            anomaly_labels=labels,
-            context_length=context_length,
-            prediction_length=prediction_length,
-            stride=stride,
-            pre_anomaly_offsets=pre_anomaly_offsets,
-            normal_lead=normal_lead,
-            normal_tail=normal_tail,
-            ratio_a=ratio_a,
-            ratio_b=ratio_b,
-            ratio_c=ratio_c,
-            rng=rng,
-        )
-        val_pairs.extend(pairs)
+    s1_val, s2_val = [], []
+    for i, (series, lbl) in enumerate(zip(val_inputs, val_labels)):
+        logger.debug(f"Val series {i + 1}/{len(val_inputs)}")
+        s1_val.extend(build_stage1_pairs(series["target"], lbl, **common,
+                                          normal_lead=normal_lead, normal_tail=normal_tail,
+                                          normal_signal_length=normal_signal_length))
+        s2_val.extend(build_stage2_pairs(series["target"], lbl, **common,
+                                          pre_anomaly_offsets=pre_anomaly_offsets,
+                                          normal_signal_length=normal_signal_length))
 
-    logger.info(
-        f"Instruction pairs — Train: {len(train_pairs)} | Val: {len(val_pairs)}"
-    )
+    logger.info(f"Stage 1 pairs — Train: {len(s1_tr)} | Val: {len(s1_val)}")
+    logger.info(f"Stage 2 pairs — Train: {len(s2_tr)} | Val: {len(s2_val)}")
 
-    # ── Step 4: Convert pairs to fixed-length model inputs ───────────────── #
-    # Each entry is {'target': array(F, context_length + prediction_length)}.
-    # Short Type B contexts are NaN-padded on the left so the series is always
-    # exactly context_length + prediction_length long.  Pass these to
-    # pipeline.fit() with min_past=context_length to lock the cut point.
-    logger.info("Converting pairs to fixed-length model inputs (NaN-padding short contexts)...")
-    train_model_inputs = pairs_to_model_inputs(train_pairs, context_length)
-    val_model_inputs   = pairs_to_model_inputs(val_pairs,   context_length)
-    logger.info(
-        f"Model inputs — Train: {len(train_model_inputs)} | Val: {len(val_model_inputs)}"
-    )
+    # ── Convert to fixed-length model inputs ─────────────────────────────── #
+    # Each entry: {'target': array(F, context_length + prediction_length)}.
+    # Short Type B contexts are NaN-padded on the left; pass to pipeline.fit()
+    # with min_past=context_length to lock the cut at the intended boundary.
+    logger.info("Converting to fixed-length model inputs (NaN-padding short contexts)...")
+    s1_tr_in  = pairs_to_model_inputs(s1_tr,  context_length, normal_signal_length=normal_signal_length)
+    s1_val_in = pairs_to_model_inputs(s1_val, context_length, normal_signal_length=normal_signal_length)
+    s2_tr_in  = pairs_to_model_inputs(s2_tr,  context_length, normal_signal_length=normal_signal_length)
+    s2_val_in = pairs_to_model_inputs(s2_val, context_length, normal_signal_length=normal_signal_length)
+    logger.info(f"Stage 1 model inputs — Train: {len(s1_tr_in)} | Val: {len(s1_val_in)}")
+    logger.info(f"Stage 2 model inputs — Train: {len(s2_tr_in)} | Val: {len(s2_val_in)}")
 
-    return train_inputs, val_inputs, train_pairs, val_pairs, train_model_inputs, val_model_inputs
+    return (train_inputs, val_inputs,
+            s1_tr, s1_val, s2_tr, s2_val,
+            s1_tr_in, s1_val_in, s2_tr_in, s2_val_in)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Statistics Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
-def log_dataset_statistics(
+def log_statistics(
     train_inputs: list,
     val_inputs: list,
-    train_pairs: list,
-    val_pairs: list,
+    s1_train_pairs: list,
+    s1_val_pairs: list,
+    s2_train_pairs: list,
+    s2_val_pairs: list,
 ) -> None:
-    """Log shape and type-distribution statistics for the full dataset."""
-
-    all_series = train_inputs + val_inputs
-    lengths  = [s["target"].shape[1] for s in all_series]
-    variates = [s["target"].shape[0] for s in all_series]
+    """Log shape and type-distribution statistics for both stages."""
+    series   = train_inputs + val_inputs
+    lengths  = [s["target"].shape[1] for s in series]
+    variates = [s["target"].shape[0] for s in series]
 
     logger.info("=" * 60)
     logger.info("RAW SERIES STATISTICS")
-    logger.info(f"  Total series : {len(all_series)}")
+    logger.info(f"  Total series : {len(series)}")
     logger.info(f"  Time steps   : min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.0f}")
     logger.info(f"  Num features : min={min(variates)}, max={max(variates)}, mean={np.mean(variates):.1f}")
 
-    all_pairs = train_pairs + val_pairs
-    if all_pairs:
-        type_counts: dict[str, int] = {}
+    for stage_name, tr_pairs, val_pairs in [
+        ("STAGE 1", s1_train_pairs, s1_val_pairs),
+        ("STAGE 2", s2_train_pairs, s2_val_pairs),
+    ]:
+        all_pairs = tr_pairs + val_pairs
+        if not all_pairs:
+            continue
+        counts: dict[str, int] = {}
         for p in all_pairs:
-            t = p.get("type", "unknown")
-            type_counts[t] = type_counts.get(t, 0) + 1
-
-        ctx_shape = all_pairs[0]["context"]["target"].shape
-        fut_shape = all_pairs[0]["future"]["target"].shape
-
+            t = p.get("type", "?")
+            counts[t] = counts.get(t, 0) + 1
         logger.info("=" * 60)
-        logger.info("INSTRUCTION PAIR STATISTICS")
-        logger.info(f"  Total pairs          : {len(all_pairs)}")
-        logger.info(f"  Train pairs          : {len(train_pairs)}")
-        logger.info(f"  Val pairs            : {len(val_pairs)}")
-        logger.info(f"  Context shape        : {ctx_shape}  [features x context_length]")
-        logger.info(f"  Future  shape        : {fut_shape}  [features x pred_length]")
-        logger.info(f"  Avg pairs per series : {len(all_pairs) / len(all_series):.1f}")
-        logger.info("  Type distribution:")
-        for type_name, count in sorted(type_counts.items()):
-            pct = count / len(all_pairs) * 100
-            logger.info(f"    {type_name:<22} : {count:>6}  ({pct:.1f}%)")
+        logger.info(f"{stage_name} INSTRUCTION PAIR STATISTICS")
+        logger.info(f"  Train: {len(tr_pairs)}  Val: {len(val_pairs)}  Total: {len(all_pairs)}")
+        logger.info(f"  Avg per series : {len(all_pairs) / len(series):.1f}")
+        logger.info("  Type distribution (raw counts, no balancing):")
+        for type_name, count in sorted(counts.items()):
+            logger.info(f"    {type_name:<22} : {count:>6}  ({count / len(all_pairs) * 100:.1f}%)")
     logger.info("=" * 60)
 
 
@@ -801,135 +639,85 @@ def log_dataset_statistics(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Prepare mTSBench data for Chronos-2 instruction tuning."
+    p = argparse.ArgumentParser(
+        description="Two-stage data prep for Chronos-2 anomaly fine-tuning."
     )
-    parser.add_argument(
-        "--data_dir",
-        default="/home/rajib/mTSBench/Datasets/mTSBench",
-        help="Root directory of the mTSBench dataset",
-    )
-    parser.add_argument(
-        "--output_dir",
-        default="./prepared_data",
-        help="Directory to write output pickle files",
-    )
-    parser.add_argument(
-        "--min_length",
-        type=int,
-        default=50,
-        help="Minimum time-series length; shorter series are discarded",
-    )
-    parser.add_argument(
-        "--val_fraction",
-        type=float,
-        default=0.1,
-        help="Fraction of series held out for validation",
-    )
-    parser.add_argument(
-        "--context_length",
-        type=int,
-        default=512,
-        help="Number of past time steps used as context (instruction)",
-    )
-    parser.add_argument(
-        "--prediction_length",
-        type=int,
-        default=64,
-        help="Number of future time steps to predict (output)",
-    )
-    parser.add_argument(
-        "--stride",
-        type=int,
-        default=None,
-        help=(
-            "Window stride for Type A sliding window. "
-            "Defaults to prediction_length // 2 if not set."
-        ),
-    )
-    parser.add_argument(
-        "--ratio_a",
-        type=float,
-        default=0.60,
-        help="Target fraction of Normal-to-Normal (Type A) pairs. Default: 0.60",
-    )
-    parser.add_argument(
-        "--ratio_b",
-        type=float,
-        default=0.30,
-        help="Target fraction of Pre-Anomaly (Type B) pairs. Default: 0.30",
-    )
-    parser.add_argument(
-        "--ratio_c",
-        type=float,
-        default=0.10,
-        help="Target fraction of Anomaly-Context (Type C) pairs. Default: 0.10",
-    )
+    p.add_argument("--data_dir",          default="/home/rajib/mTSBench/Datasets/mTSBench",
+                   help="Root directory of the mTSBench dataset")
+    p.add_argument("--output_dir",        default="./prepared_data",
+                   help="Root output directory; stage1/ and stage2/ subdirs are created inside")
+    p.add_argument("--min_length",        type=int,   default=50,
+                   help="Minimum series length; shorter series are discarded")
+    p.add_argument("--val_fraction",      type=float, default=0.1,
+                   help="Fraction of series held out for validation")
+    p.add_argument("--context_length",    type=int,   default=512,
+                   help="Number of past time steps used as context")
+    p.add_argument("--prediction_length", type=int,   default=64,
+                   help="Number of future time steps to predict")
+    p.add_argument("--stride",            type=int,   default=None,
+                   help="Sliding-window stride (default: prediction_length // 2)")
+    p.add_argument("--pre_anomaly_offsets", type=int, nargs="+",
+                   default=[1, 16, 32, 64, 128],
+                   help="Steps INTO the anomaly the Type B future window's end reaches. "
+                        "Each value produces one pair per anomaly event. "
+                        "Values exceeding the anomaly length are clamped. "
+                        "Default: 1 16 32 64 128")
+    p.add_argument("--normal_signal_length", type=int, default=0,
+                   help="If > 0, prepend a per-series normal reference signal of this length "
+                        "to each pair's target. The output target layout becomes "
+                        "[normal (N) | context (C) | future (P)]. Pass the same value to the "
+                        "model via sep_patch_index=N/input_patch_size and set "
+                        "context_length=N+C during fine-tuning. Default: 0 (disabled).")
+    args = p.parse_args()
 
-    args = parser.parse_args()
-
-    # Validate ratios sum to 1.0
-    total_ratio = args.ratio_a + args.ratio_b + args.ratio_c
-    if not np.isclose(total_ratio, 1.0, atol=1e-3):
-        raise ValueError(
-            f"ratio_a + ratio_b + ratio_c must sum to 1.0 (got {total_ratio:.3f})"
-        )
-
-    # Default stride = prediction_length // 2
     if args.stride is None:
         args.stride = max(1, args.prediction_length // 2)
         logger.info(f"Stride not set — using default: stride={args.stride}")
 
+    # Sort and deduplicate offsets; keep only positive values
+    args.pre_anomaly_offsets = sorted(set(o for o in args.pre_anomaly_offsets if o > 0))
+    if not args.pre_anomaly_offsets:
+        raise ValueError("--pre_anomaly_offsets must contain at least one positive integer.")
+    logger.info(f"Pre-anomaly offsets: {args.pre_anomaly_offsets}")
+
     os.makedirs(args.output_dir, exist_ok=True)
 
-    train_inputs, val_inputs, train_pairs, val_pairs, train_model_inputs, val_model_inputs = prepare_inputs(
+    (train_inputs, val_inputs,
+     s1_tr, s1_val, s2_tr, s2_val,
+     s1_tr_in, s1_val_in, s2_tr_in, s2_val_in) = prepare_two_stage_inputs(
         data_dir=args.data_dir,
         min_length=args.min_length,
         val_fraction=args.val_fraction,
         context_length=args.context_length,
         prediction_length=args.prediction_length,
         stride=args.stride,
-        ratio_a=args.ratio_a,
-        ratio_b=args.ratio_b,
-        ratio_c=args.ratio_c,
+        pre_anomaly_offsets=args.pre_anomaly_offsets,
+        normal_signal_length=args.normal_signal_length,
     )
 
-    # ── Save outputs ─────────────────────────────────────────────────────── #
-    #
-    #  train_inputs.pkl / val_inputs.pkl
-    #    Original format → list of {'target': array(F, T)}
-    #    Use directly with pipeline.fit() for baseline (no instruction tuning)
-    #
-    #  train_pairs.pkl / val_pairs.pkl
-    #    Three-type instruction pairs for analysis/inspection
-    #    Format: {'context': {'target': array(F, ctx)},
-    #             'future':  {'target': array(F, pred)},
-    #             'type':    str}
-    #
-    #  train_model_inputs.pkl / val_model_inputs.pkl
-    #    Fixed-length inputs ready for pipeline.fit() — USE THESE for fine-tuning
-    #    Format: {'target': array(F, context_length + prediction_length)}
-    #    - Contexts shorter than context_length are NaN-padded on the left
-    #    - Pass to pipeline.fit() with min_past=context_length to guarantee
-    #      the cut always falls at the intended context/future boundary
-    #
-    # ─────────────────────────────────────────────────────────────────────── #
-    files_to_save = {
-        "train_inputs.pkl"      : train_inputs,
-        "val_inputs.pkl"        : val_inputs,
-        "train_pairs.pkl"       : train_pairs,
-        "val_pairs.pkl"         : val_pairs,
-        "train_model_inputs.pkl": train_model_inputs,
-        "val_model_inputs.pkl"  : val_model_inputs,
-    }
+    # Save stage1/ and stage2/ outputs
+    # train_model_inputs.pkl / val_model_inputs.pkl  — USE THESE for pipeline.fit()
+    #   Format: {'target': array(F, context_length + prediction_length)}
+    # train_pairs.pkl / val_pairs.pkl  — for analysis/inspection
+    #   Format: {'context': {'target': ...}, 'future': {'target': ...}, 'type': str}
+    for stage, (pairs_tr, pairs_val, inputs_tr, inputs_val) in {
+        "stage1": (s1_tr, s1_val, s1_tr_in, s1_val_in),
+        "stage2": (s2_tr, s2_val, s2_tr_in, s2_val_in),
+    }.items():
+        stage_dir = os.path.join(args.output_dir, stage)
+        os.makedirs(stage_dir, exist_ok=True)
+        for fname, data in [
+            ("train_pairs.pkl",        pairs_tr),
+            ("val_pairs.pkl",          pairs_val),
+            ("train_model_inputs.pkl", inputs_tr),
+            ("val_model_inputs.pkl",   inputs_val),
+        ]:
+            path = os.path.join(stage_dir, fname)
+            with open(path, "wb") as f:
+                pickle.dump(data, f)
+            logger.info(f"{stage} — {len(data):>6} entries → {path}")
 
-    for filename, data in files_to_save.items():
-        path = os.path.join(args.output_dir, filename)
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
-        logger.info(f"Saved {len(data):>6} entries → {path}")
-
-    log_dataset_statistics(train_inputs, val_inputs, train_pairs, val_pairs)
+    log_statistics(train_inputs, val_inputs, s1_tr, s1_val, s2_tr, s2_val)
 
 
 if __name__ == "__main__":
