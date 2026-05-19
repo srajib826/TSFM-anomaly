@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import functools
 import logging
 import os
 import pickle
@@ -111,6 +112,11 @@ def parse_args():
                    help="Disable FP16 mixed precision")
     p.add_argument("--logging_steps", type=int, default=100,
                    help="Log training loss every N steps")
+    p.add_argument("--warmup_ratio", type=float, default=0.05,
+                   help="Fraction of steps used for LR warmup (default: 0.05)")
+    p.add_argument("--lr_scheduler_type", default="cosine",
+                   choices=["linear", "cosine", "cosine_with_restarts", "constant"],
+                   help="LR scheduler type (default: cosine)")
 
     # Stage 1 hyperparameters
     p.add_argument("--stage1_steps", type=int, default=5000,
@@ -123,6 +129,11 @@ def parse_args():
                    help="Number of gradient steps for Stage 2 (gradient ascent)")
     p.add_argument("--stage2_lr", type=float, default=None,
                    help="Learning rate for Stage 2 (default: 1e-5 for LoRA, 1e-6 for full)")
+    p.add_argument("--stage2_loss_ceiling", type=float, default=15.0,
+                   help="Cap the raw loss at this value before negating for gradient ascent. "
+                        "Prevents divergence: once the model predicts badly enough (loss >= ceiling), "
+                        "gradients go to zero. Recommended: ~3-5x the stage-1 final eval loss. "
+                        "Set to 0 to disable (not recommended).")
 
     # Output
     p.add_argument("--stage1_output_dir", default="./chronos2-stage1-[SEP]",
@@ -139,6 +150,11 @@ def build_lora_config(args):
     except ImportError:
         raise ImportError("peft is required for LoRA fine-tuning. Install with: pip install peft")
 
+    # When SEP is enabled, the `shared` embedding gets a new randomly-initialised
+    # row for the SEP token. Without modules_to_save=["shared"], PEFT freezes it
+    # entirely and the SEP token never learns any meaning.
+    modules_to_save = ["shared"] if args.enable_sep_token else None
+
     return LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -150,6 +166,7 @@ def build_lora_config(args):
             "self_attention.o",
             "output_patch_embedding.output_layer",
         ],
+        modules_to_save=modules_to_save,
     )
 
 
@@ -181,6 +198,8 @@ def build_fit_kwargs(args, inputs, val_inputs, lr, num_steps, output_dir, lora_c
         logging_steps=args.logging_steps,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         fp16=use_fp16,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
     )
     if args.enable_sep_token:
         if args.normal_signal_length <= 0:
@@ -199,7 +218,7 @@ def build_fit_kwargs(args, inputs, val_inputs, lr, num_steps, output_dir, lora_c
 
 def main():
     args = parse_args()
-
+  
     if args.skip_stage1 and args.stage1_ckpt is None:
         raise ValueError("--stage1_ckpt must be specified when --skip_stage1 is set")
 
@@ -306,8 +325,11 @@ def main():
         lora_config=lora_config,
         use_fp16=use_fp16,
     )
-    # Inject anomaly trainer — this is the only difference from Stage 1
-    stage2_fit_kwargs["trainer_cls"] = Chronos2AnomalyTrainer
+    # Inject anomaly trainer with loss ceiling to prevent gradient ascent divergence
+    loss_ceiling = args.stage2_loss_ceiling if args.stage2_loss_ceiling > 0 else None
+    stage2_fit_kwargs["trainer_cls"] = functools.partial(
+        Chronos2AnomalyTrainer, loss_ceiling=loss_ceiling
+    )
     print("Stage 2 finetuning....")
     finetuned_pipeline = stage1_pipeline.fit(**stage2_fit_kwargs)
 
