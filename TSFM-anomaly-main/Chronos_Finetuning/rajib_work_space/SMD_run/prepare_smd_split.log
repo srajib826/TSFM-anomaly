@@ -1,0 +1,58 @@
+2026-06-25 15:59:40,061 INFO Found 18 SMD *test.csv files under /home/rajib/mTSBench/Datasets/mTSBench/SMD
+2026-06-25 15:59:40,062 INFO ======================================================================
+2026-06-25 15:59:40,062 INFO FILE-BASED SPLIT
+2026-06-25 15:59:40,062 INFO   Total files : 18
+2026-06-25 15:59:40,062 INFO   Train files : 12  -> ['SMD_machine-1-2_test.csv', 'SMD_machine-1-3_test.csv', 'SMD_machine-1-4_test.csv', 'SMD_machine-1-6_test.csv', 'SMD_machine-1-7_test.csv', 'SMD_machine-1-8_test.csv', 'SMD_machine-2-2_test.csv', 'SMD_machine-2-3_test.csv', 'SMD_machine-2-4_test.csv', 'SMD_machine-2-7_test.csv', 'SMD_machine-3-10_test.csv', 'SMD_machine-3-3_test.csv']
+2026-06-25 15:59:40,062 INFO   Val files   : 1  -> ['SMD_machine-3-2_test.csv']
+2026-06-25 15:59:40,063 INFO   Test files  : 5  -> ['SMD_machine-2-1_test.csv', 'SMD_machine-2-5_test.csv', 'SMD_machine-2-9_test.csv', 'SMD_machine-3-5_test.csv', 'SMD_machine-3-6_test.csv']
+2026-06-25 15:59:40,063 INFO ======================================================================
+2026-06-25 15:59:41,527 INFO Pairs — train: 307 | val: 22 | test: 107
+2026-06-25 15:59:41,528 INFO Writing model-input pickles...
+2026-06-25 15:59:41,615 INFO train_model_inputs.pkl          307 windows  (future steps: normal=18493, anomaly=1155 [5.9%]) → /home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_run/train_model_inputs.pkl
+2026-06-25 15:59:41,621 INFO val_model_inputs.pkl             22 windows  (future steps: normal=1344, anomaly=64 [4.5%]) → /home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_run/val_model_inputs.pkl
+2026-06-25 15:59:41,648 INFO test_model_inputs.pkl           107 windows  (future steps: normal=6433, anomaly=415 [6.1%]) → /home/rajib/Sir_git_TSAD/TSFM-anomaly/Chronos_Finetuning/rajib_work_space/SMD_run/test_model_inputs.pkl
+2026-06-25 15:59:41,648 INFO Done.
+2026-06-25 16:07:21,424 INFO Found 18 SMD *test.csv files under /home/rajib/mTSBench/Datasets/mTSBench/SMD
+2026-06-25 16:07:21,425 INFO ======================================================================
+2026-06-25 16:07:21,426 INFO FILE-BASED SPLIT
+2026-06-25 16:07:21,426 INFO   Total files : 18
+2026-06-25 16:07:21,426 INFO   Train files : 13  -> ['SMD_machine-1-2_test.csv', 'SMD_machine-1-3_test.csv', 'SMD_machine-1-4_test.csv', 'SMD_machine-1-6_test.csv', 'SMD_machine-1-7_test.csv', 'SMD_machine-1-8_test.csv', 'SMD_machine-2-2_test.csv', 'SMD_machine-2-3_test.csv', 'SMD_machine-2-4_test.csv', 'SMD_machine-2-7_test.csv', 'SMD_machine-3-10_test.csv', 'SMD_machine-3-2_test.csv', 'SMD_machine-3-3_test.csv']
+2026-06-25 16:07:21,427 INFO   Val files   : 0  -> []
+2026-06-25 16:07:21,427 INFO   Test files  : 5  -> ['SMD_machine-2-1_test.csv', 'SMD_machine-2-5_test.csv', 'SMD_machine-2-9_test.csv', 'SMD_machine-3-5_test.csv', 'SMD_machine-3-6_test.csv']
+2026-06-25 16:07:21,427 INFO ======================================================================
+2026-06-25 16:07:22,884 INFO Pairs — train: 329 | val: 0 | test: 107
+2026-06-25 16:07:22,885 INFO Writing model-input pickles...
+2026-06-25 16:07:22,993 INFO train_model_inputs.pkl          329 windows  (future steps: normal=19837, anomaly=1219 [5.8%]) → ./train_model_inputs.pkl
+2026-06-25 16:07:22,996 INFO val_fraction=0 → no val_model_inputs.pkl written (run finetune with NO_VALIDATION=1)
+2026-06-25 16:07:23,027 INFO test_model_inputs.pkl           107 windows  (future steps: normal=6433, anomaly=415 [6.1%]) → ./test_model_inputs.pkl
+2026-06-25 16:07:23,027 INFO Done.
+2026-06-25 16:25:55,952 INFO Found 18 SMD *test.csv files under /home/rajib/mTSBench/Datasets/mTSBench/SMD
+2026-06-25 16:25:55,953 INFO ======================================================================
+2026-06-25 16:25:55,953 INFO FILE-BASED SPLIT
+2026-06-25 16:25:55,953 INFO   Total files : 18
+2026-06-25 16:25:55,953 INFO   Train files : 13  -> ['SMD_machine-1-2_test.csv', 'SMD_machine-1-3_test.csv', 'SMD_machine-1-4_test.csv', 'SMD_machine-1-6_test.csv', 'SMD_machine-1-7_test.csv', 'SMD_machine-1-8_test.csv', 'SMD_machine-2-2_test.csv', 'SMD_machine-2-3_test.csv', 'SMD_machine-2-4_test.csv', 'SMD_machine-2-7_test.csv', 'SMD_machine-3-10_test.csv', 'SMD_machine-3-2_test.csv', 'SMD_machine-3-3_test.csv']
+2026-06-25 16:25:55,953 INFO   Val files   : 0  -> []
+2026-06-25 16:25:55,953 INFO   Test files  : 5  -> ['SMD_machine-2-1_test.csv', 'SMD_machine-2-5_test.csv', 'SMD_machine-2-9_test.csv', 'SMD_machine-3-5_test.csv', 'SMD_machine-3-6_test.csv']
+2026-06-25 16:25:55,953 INFO ======================================================================
+2026-06-25 16:25:57,236 INFO Pairs — train: 2919 | val: 0 | test: 938
+2026-06-25 16:25:57,237 INFO Writing model-input pickles...
+2026-06-25 16:25:58,190 INFO train_model_inputs.pkl         2919 windows (shuffled)  (future steps: normal=176282, anomaly=10534 [5.6%]) → ./train_model_inputs.pkl
+2026-06-25 16:25:58,217 INFO val_fraction=0 → no val_model_inputs.pkl written (run finetune with NO_VALIDATION=1)
+2026-06-25 16:25:58,521 INFO test_model_inputs.pkl           938 windows (ordered)  (future steps: normal=56754, anomaly=3278 [5.5%]) → ./test_model_inputs.pkl
+2026-06-25 16:25:58,528 INFO test_series_meta.pkl               5 series (per-timestamp ground-truth labels) → ./test_series_meta.pkl
+2026-06-25 16:25:58,528 INFO Done.
+2026-06-25 16:29:04,073 INFO Found 18 SMD *test.csv files under /home/rajib/mTSBench/Datasets/mTSBench/SMD
+2026-06-25 16:29:04,074 INFO ======================================================================
+2026-06-25 16:29:04,074 INFO FILE-BASED SPLIT
+2026-06-25 16:29:04,074 INFO   Total files : 18
+2026-06-25 16:29:04,074 INFO   Train files : 13  -> ['SMD_machine-1-2_test.csv', 'SMD_machine-1-3_test.csv', 'SMD_machine-1-4_test.csv', 'SMD_machine-1-6_test.csv', 'SMD_machine-1-7_test.csv', 'SMD_machine-1-8_test.csv', 'SMD_machine-2-2_test.csv', 'SMD_machine-2-3_test.csv', 'SMD_machine-2-4_test.csv', 'SMD_machine-2-7_test.csv', 'SMD_machine-3-10_test.csv', 'SMD_machine-3-2_test.csv', 'SMD_machine-3-3_test.csv']
+2026-06-25 16:29:04,074 INFO   Val files   : 0  -> []
+2026-06-25 16:29:04,074 INFO   Test files  : 5  -> ['SMD_machine-2-1_test.csv', 'SMD_machine-2-5_test.csv', 'SMD_machine-2-9_test.csv', 'SMD_machine-3-5_test.csv', 'SMD_machine-3-6_test.csv']
+2026-06-25 16:29:04,074 INFO ======================================================================
+2026-06-25 16:29:05,263 INFO Pairs — train: 2919 | val: 0 | test: 938
+2026-06-25 16:29:05,264 INFO Writing model-input pickles...
+2026-06-25 16:29:06,074 INFO train_model_inputs.pkl         2919 windows (shuffled)  (future steps: normal=176282, anomaly=10534 [5.6%]) → ./train_model_inputs.pkl
+2026-06-25 16:29:06,102 INFO val_fraction=0 → no val_model_inputs.pkl written (run finetune with NO_VALIDATION=1)
+2026-06-25 16:29:06,360 INFO test_model_inputs.pkl           938 windows (ordered)  (future steps: normal=56754, anomaly=3278 [5.5%]) → ./test_model_inputs.pkl
+2026-06-25 16:29:06,367 INFO test_series_meta.pkl               5 series (per-timestamp ground-truth labels) → ./test_series_meta.pkl
+2026-06-25 16:29:06,367 INFO Done.

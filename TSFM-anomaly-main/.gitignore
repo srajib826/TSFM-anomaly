@@ -1,0 +1,12 @@
+# Python cache directories
+__pycache__/
+
+# Pickle files
+*.pkl
+
+# Log folders
+**/log/
+**/logs/
+
+# Specific large model folders
+Chronos_Finetuning/rajib_work_space/chronos2-single-stage_NS1000_V5/
